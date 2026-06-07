@@ -21,6 +21,11 @@ const LINES = [
   [2, 4, 6],
 ];
 
+const COLOR_UNLOCK_ORDER: RingColor[] = ['red', 'yellow', 'green', 'blue', 'orange', 'pink', 'purple'];
+const START_COLOR_COUNT = 4;
+const CLEARS_PER_COLOR_UNLOCK = 3;
+const AVOID_IMMEDIATE_CLEAR_AFTER = 2;
+
 interface SimulatedPlacement {
   board: CellState[];
   clearedRings: number;
@@ -36,6 +41,7 @@ export class GameModel {
   public hand: Array<Piece | null> = [null, null, null];
   public score = 0;
   public gameOver = false;
+  public clearCount = 0;
 
   private nextPieceId = 1;
 
@@ -48,6 +54,7 @@ export class GameModel {
     this.hand = [null, null, null];
     this.score = 0;
     this.gameOver = false;
+    this.clearCount = 0;
     this.nextPieceId = 1;
     this.dealNextHand();
   }
@@ -63,13 +70,7 @@ export class GameModel {
 
   public canCommitPieceToCell(pieceIndex: number, cellIndex: number): boolean {
     const piece = this.hand[pieceIndex];
-    if (!piece || !this.canPlacePiece(piece, cellIndex)) {
-      return false;
-    }
-
-    const preview = this.simulatePlacement(piece, cellIndex, this.board);
-    const remaining = this.hand.filter((handPiece, index) => index !== pieceIndex && handPiece !== null) as Piece[];
-    return remaining.every((handPiece) => this.hasAnyPlacement(handPiece, preview.board));
+    return !!piece && this.canPlacePiece(piece, cellIndex);
   }
 
   public placePiece(pieceIndex: number, cellIndex: number): PlacementResult {
@@ -79,7 +80,7 @@ export class GameModel {
     }
 
     if (!this.canCommitPieceToCell(pieceIndex, cellIndex)) {
-      return this.rejectedPlacement('blocked-remaining-piece');
+      return this.rejectedPlacement('invalid-placement');
     }
 
     const preview = this.simulatePlacement(piece, cellIndex, this.board);
@@ -88,6 +89,9 @@ export class GameModel {
 
     const scoreDelta = piece.rings.length + preview.clearedRings * 10;
     this.score += scoreDelta;
+    if (preview.clearedRings > 0) {
+      this.clearCount += 1;
+    }
 
     if (this.hand.every((handPiece) => handPiece === null)) {
       this.dealNextHand();
@@ -167,7 +171,11 @@ export class GameModel {
   }
 
   private findPlayableBatch(board: CellState[]): Array<Piece | null> | null {
-    const path = this.searchBatch(board, 3);
+    let path = this.searchBatch(board, 3, false);
+    if (!path) {
+      path = this.searchBatch(board, 3, true);
+    }
+
     if (!path) {
       return null;
     }
@@ -178,12 +186,12 @@ export class GameModel {
     }));
   }
 
-  private searchBatch(board: CellState[], remainingCount: number): Piece[] | null {
+  private searchBatch(board: CellState[], remainingCount: number, allowSameColorDouble: boolean): Piece[] | null {
     if (remainingCount === 0) {
       return [];
     }
 
-    const candidates = this.rankCandidates(this.enumerateLegalCandidates(board), board)
+    const candidates = this.rankCandidates(this.enumerateLegalCandidates(board, allowSameColorDouble), board)
       .slice(0, this.isEveryCellOccupied(board) ? 60 : 42);
 
     for (const ranked of candidates) {
@@ -191,7 +199,7 @@ export class GameModel {
       const placements = this.getRankedPlacements(piece, board);
       for (const cellIndex of placements) {
         const preview = this.simulatePlacement(piece, cellIndex, board);
-        const rest = this.searchBatch(preview.board, remainingCount - 1);
+        const rest = this.searchBatch(preview.board, remainingCount - 1, allowSameColorDouble);
         if (rest) {
           return [piece, ...rest];
         }
@@ -201,11 +209,12 @@ export class GameModel {
     return null;
   }
 
-  private enumerateLegalCandidates(board: CellState[]): Piece[] {
+  private enumerateLegalCandidates(board: CellState[], allowSameColorDouble: boolean): Piece[] {
     const candidates: Piece[] = [];
+    const colors = this.getActiveColors();
 
     for (const size of RING_SIZES) {
-      for (const color of RING_COLORS) {
+      for (const color of colors) {
         const piece = this.makeCandidate([{ size, color }]);
         if (this.hasAnyPlacement(piece, board)) {
           candidates.push(piece);
@@ -215,8 +224,12 @@ export class GameModel {
 
     for (let firstSizeIndex = 0; firstSizeIndex < RING_SIZES.length; firstSizeIndex += 1) {
       for (let secondSizeIndex = firstSizeIndex + 1; secondSizeIndex < RING_SIZES.length; secondSizeIndex += 1) {
-        for (const firstColor of RING_COLORS) {
-          for (const secondColor of RING_COLORS) {
+        for (const firstColor of colors) {
+          for (const secondColor of colors) {
+            if (!allowSameColorDouble && firstColor === secondColor) {
+              continue;
+            }
+
             const piece = this.makeCandidate([
               { size: RING_SIZES[firstSizeIndex], color: firstColor },
               { size: RING_SIZES[secondSizeIndex], color: secondColor },
@@ -240,7 +253,10 @@ export class GameModel {
   }
 
   private scoreCandidate(piece: Piece, board: CellState[]): number {
-    let bestScore = this.isEveryCellOccupied(board) ? 20 : 0;
+    const everyCellOccupied = this.isEveryCellOccupied(board);
+    const avoidImmediateClear = this.shouldAvoidImmediateClears(board);
+    let bestScore = everyCellOccupied ? 20 : 0;
+    let hasImmediateClearPlacement = false;
 
     for (let cellIndex = 0; cellIndex < CELL_COUNT; cellIndex += 1) {
       if (!this.canPlacePiece(piece, cellIndex, board)) {
@@ -248,16 +264,65 @@ export class GameModel {
       }
 
       const preview = this.simulatePlacement(piece, cellIndex, board);
-      let score = preview.clearedRings * 1000;
+      if (preview.clearedRings > 0) {
+        hasImmediateClearPlacement = true;
+      }
+
+      let score = this.scoreClearResult(preview.clearedRings, avoidImmediateClear, everyCellOccupied);
       for (const ring of piece.rings) {
-        score += this.lineThreatScore(board, cellIndex, ring.color);
-        score += this.stackThreatScore(board[cellIndex], ring.color);
+        score += this.scoreThreat(this.lineThreatScore(board, cellIndex, ring.color), avoidImmediateClear, everyCellOccupied);
+        score += this.scoreThreat(this.stackThreatScore(board[cellIndex], ring.color), avoidImmediateClear, everyCellOccupied);
       }
 
       bestScore = Math.max(bestScore, score);
     }
 
+    if (avoidImmediateClear && hasImmediateClearPlacement) {
+      bestScore -= 3200;
+    }
+
     return bestScore + Math.random();
+  }
+
+  private getActiveColors(): RingColor[] {
+    const unlockedCount = Math.min(
+      COLOR_UNLOCK_ORDER.length,
+      START_COLOR_COUNT + Math.floor(this.clearCount / CLEARS_PER_COLOR_UNLOCK),
+    );
+
+    return COLOR_UNLOCK_ORDER.slice(0, unlockedCount);
+  }
+
+  private shouldAvoidImmediateClears(board: CellState[]): boolean {
+    return this.clearCount >= AVOID_IMMEDIATE_CLEAR_AFTER && !this.isEveryCellOccupied(board);
+  }
+
+  private scoreClearResult(clearedRings: number, avoidImmediateClear: boolean, everyCellOccupied: boolean): number {
+    if (clearedRings <= 0) {
+      return avoidImmediateClear ? 120 : 0;
+    }
+
+    if (everyCellOccupied) {
+      return clearedRings * 1200;
+    }
+
+    if (avoidImmediateClear) {
+      return -clearedRings * 2600;
+    }
+
+    return clearedRings * 1000;
+  }
+
+  private scoreThreat(threatScore: number, avoidImmediateClear: boolean, everyCellOccupied: boolean): number {
+    if (everyCellOccupied) {
+      return threatScore;
+    }
+
+    if (avoidImmediateClear) {
+      return Math.floor(threatScore * 0.15);
+    }
+
+    return threatScore;
   }
 
   private lineThreatScore(board: CellState[], cellIndex: number, color: RingColor): number {
@@ -293,6 +358,9 @@ export class GameModel {
 
   private getRankedPlacements(piece: Piece, board: CellState[]): number[] {
     const placements: Array<{ cellIndex: number; score: number }> = [];
+    const everyCellOccupied = this.isEveryCellOccupied(board);
+    const avoidImmediateClear = this.shouldAvoidImmediateClears(board);
+
     for (let cellIndex = 0; cellIndex < CELL_COUNT; cellIndex += 1) {
       if (!this.canPlacePiece(piece, cellIndex, board)) {
         continue;
@@ -301,7 +369,8 @@ export class GameModel {
       const preview = this.simulatePlacement(piece, cellIndex, board);
       placements.push({
         cellIndex,
-        score: preview.clearedRings * 1000 + piece.rings.reduce((sum, ring) => sum + this.lineThreatScore(board, cellIndex, ring.color), 0),
+        score: this.scoreClearResult(preview.clearedRings, avoidImmediateClear, everyCellOccupied)
+          + piece.rings.reduce((sum, ring) => sum + this.scoreThreat(this.lineThreatScore(board, cellIndex, ring.color), avoidImmediateClear, everyCellOccupied), 0),
       });
     }
 
